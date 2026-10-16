@@ -1,0 +1,6 @@
+FROM nginx:alpine
+
+COPY index-v2.html /usr/share/nginx/html/index.html
+
+EXPOSE 80
+
