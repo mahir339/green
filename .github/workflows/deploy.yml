@@ -1,0 +1,68 @@
+
+name: Blue-Green Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - "index.html"
+      - "index-v2.html"
+      - "deploy.sh"
+      - ".github/workflows/deploy.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blue-green-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare deployment directory
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -eu
+            mkdir -p "$HOME/green"
+
+      - name: Copy application files to Ubuntu
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          port: 22
+          source: "Dockerfile,index.html,index-v2.html,deploy.sh"
+          target: "~/green"
+
+      - name: Execute deployment script over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 15m
+          script: |
+            set -eu
+            cd "$HOME/green"
+            chmod +x deploy.sh
+            bash -n deploy.sh
+            ./deploy.sh

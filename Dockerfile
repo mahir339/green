@@ -1,6 +1,9 @@
+
 FROM nginx:alpine
 
-COPY index-v2.html /usr/share/nginx/html/index.html
+ARG APP_FILE=index.html
+
+COPY ${APP_FILE} /usr/share/nginx/html/index.html
 
 EXPOSE 80
 
