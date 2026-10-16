@@ -1,27 +1,20 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Blue-Green deployment configuration
-APP_DIR="$HOME/green"
-STATE_FILE="$APP_DIR/deployment.state"
-LOG_DIR="$APP_DIR/logs"
-LOG_FILE="$LOG_DIR/deployment.log"
+APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+APP_FILE="${APP_FILE:-index-v2.html}"
 
 PORT_MIN=2000
 PORT_MAX=2100
-
-# This deployment uses Nginx on port 8080 to avoid
-# changing an unrelated existing Nginx site on port 80.
-NGINX_PORT=8080
-NGINX_CONF="/etc/nginx/conf.d/blue-green.conf"
-
-ACTIVE_NAME="green"
-CANDIDATE_NAME="blue"
 IMAGE_NAME="green-app"
-PREVIOUS_NAME="green-previous"
+NGINX_HELPER="/usr/local/sbin/blue-green-nginx-switch"
 
-mkdir -p "$LOG_DIR"
+STATE_DIR="$HOME/.local/state/blue-green-deployment"
+STATE_FILE="$STATE_DIR/deployment.state"
+LOG_FILE="$STATE_DIR/deployment.log"
+LOCK_FILE="$STATE_DIR/deployment.lock"
+
+mkdir -p "$STATE_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() {
@@ -33,20 +26,6 @@ die() {
     exit 1
 }
 
-require_commands() {
-    local command_name
-    for command_name in docker curl ss shuf; do
-        command -v "$command_name" >/dev/null 2>&1 ||
-            die "Required command not found: $command_name"
-    done
-
-    command -v nginx >/dev/null 2>&1 ||
-        die "Nginx is not installed or nginx is not in PATH"
-
-    sudo -n true ||
-        die "Deployment user needs non-interactive sudo permissions for Nginx operations"
-}
-
 container_exists() {
     docker container inspect "$1" >/dev/null 2>&1
 }
@@ -54,13 +33,10 @@ container_exists() {
 port_in_use() {
     local port="$1"
 
-    # Check host listening sockets.
     if ss -H -ltn "sport = :$port" | grep -q .; then
         return 0
     fi
 
-    # Check Docker-published ports, including containers that may
-    # not be represented clearly by the host socket listing.
     if docker ps -a --format '{{.Ports}}' |
         grep -Eq "(^|[,: ])(0\\.0\\.0\\.0:|127\\.0\\.0\\.1:|\\[::\\]:)?${port}->"; then
         return 0
@@ -77,7 +53,6 @@ find_available_port() {
         port="$(shuf -i "$PORT_MIN-$PORT_MAX" -n 1)"
 
         if ! port_in_use "$port"; then
-            log "Selected available port: $port"
             printf '%s\n' "$port"
             return 0
         fi
@@ -85,19 +60,17 @@ find_available_port() {
         attempts=$((attempts + 1))
     done
 
-    die "Could not find a free port between $PORT_MIN and $PORT_MAX"
+    return 1
 }
 
 wait_for_health() {
     local port="$1"
     local attempt
 
-    log "Checking application health on port $port"
-
     for attempt in $(seq 1 30); do
-        if curl --fail --silent --show-error \
-            --max-time 2 "http://127.0.0.1:$port/" >/dev/null 2>&1; then
-            log "Application is healthy on port $port"
+        if curl --fail --silent --max-time 2 \
+            "http://127.0.0.1:${port}/" >/dev/null; then
+            log "Health check passed on port $port"
             return 0
         fi
 
@@ -107,216 +80,149 @@ wait_for_health() {
     return 1
 }
 
-write_nginx_config() {
-    local port="$1"
-    local temporary_file
-
-    temporary_file="$(mktemp)"
-
-    cat > "$temporary_file" <<EOF
-server {
-    listen ${NGINX_PORT};
-    server_name _;
-
-    location / {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
-
-    sudo -n install -m 0644 "$temporary_file" "$NGINX_CONF"
-    rm -f "$temporary_file"
-}
-
-reload_nginx() {
-    sudo -n nginx -t
-    sudo -n systemctl reload nginx
-}
-
 save_state() {
-    local port="$1"
-    local temporary_file
+    local slot="$1"
+    local port="$2"
+    local temp_file
 
-    temporary_file="$(mktemp "$APP_DIR/.deployment.state.XXXXXX")"
+    temp_file="$(mktemp "$STATE_DIR/.state.XXXXXX")"
 
     {
-        printf 'ACTIVE_SLOT=green\n'
+        printf 'ACTIVE_SLOT=%s\n' "$slot"
         printf 'ACTIVE_PORT=%s\n' "$port"
-    } > "$temporary_file"
+    } > "$temp_file"
 
-    chmod 600 "$temporary_file"
-    mv -f "$temporary_file" "$STATE_FILE"
-}
-
-rollback_nginx() {
-    log "Restoring the previous Nginx configuration"
-
-    if [[ -n "${OLD_CONFIG_BACKUP:-}" && -f "$OLD_CONFIG_BACKUP" ]]; then
-        sudo -n cp "$OLD_CONFIG_BACKUP" "$NGINX_CONF"
-        reload_nginx || log "WARNING: Nginx reload failed during rollback"
-    else
-        log "No previous Nginx configuration backup is available"
-    fi
-}
-
-cleanup_candidate() {
-    if container_exists "$CANDIDATE_NAME"; then
-        log "Removing failed candidate container"
-        docker rm -f "$CANDIDATE_NAME" || true
-    fi
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$STATE_FILE"
 }
 
 deploy() {
-    local candidate_port
+    local active_slot=""
     local active_port=""
-    local old_config_backup=""
-    local had_previous_config=0
-    local previous_state_backup=""
-    local bootstrap=0
-    local switched=0
+    local candidate_slot=""
+    local candidate_port=""
+    local image_tag
+    local version_label
 
     cd "$APP_DIR"
 
-    require_commands
+    [[ "$APP_FILE" == "index.html" ||
+       "$APP_FILE" == "index-v2.html" ]] ||
+        die "APP_FILE must be index.html or index-v2.html"
 
-    [[ -f Dockerfile ]] || die "Dockerfile not found in $APP_DIR"
-    [[ -f index.html ]] || die "index.html not found"
-    [[ -f index-v2.html ]] || die "index-v2.html not found"
+    [[ -f Dockerfile ]] || die "Dockerfile is missing"
+    [[ -f "$APP_FILE" ]] || die "$APP_FILE is missing"
 
-    # Refuse to overwrite an unexpected container.
-    if container_exists "$CANDIDATE_NAME"; then
-        die "Container '$CANDIDATE_NAME' already exists; investigate before continuing"
+    command -v docker >/dev/null || die "Docker is not installed"
+    command -v curl >/dev/null || die "curl is not installed"
+    command -v ss >/dev/null || die "ss is not installed"
+    command -v shuf >/dev/null || die "shuf is not installed"
+    command -v flock >/dev/null || die "flock is not installed"
+
+    [[ -x "$NGINX_HELPER" ]] ||
+        die "Nginx helper is missing or not executable: $NGINX_HELPER"
+
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "Another deployment is already running"
+
+    docker info >/dev/null 2>&1 ||
+        die "Docker is unavailable to this user"
+
+    if [[ "$APP_FILE" == "index.html" ]]; then
+        version_label="GREEN"
+    else
+        version_label="BLUE"
     fi
 
-    if container_exists "$PREVIOUS_NAME"; then
-        die "Container '$PREVIOUS_NAME' already exists; investigate before continuing"
-    fi
+    if [[ -f "$STATE_FILE" ]]; then
+        active_slot="$(sed -n 's/^ACTIVE_SLOT=//p' "$STATE_FILE")"
+        active_port="$(sed -n 's/^ACTIVE_PORT=//p' "$STATE_FILE")"
 
-    # Bootstrap the stable Version 1 container on the first run.
-    if ! container_exists "$ACTIVE_NAME"; then
-        bootstrap=1
-        log "No active Green container found; bootstrapping Version 1"
+        [[ "$active_slot" == "green" || "$active_slot" == "blue" ]] ||
+            die "Invalid active slot in deployment state"
 
-        local bootstrap_port
-        bootstrap_port="$(find_available_port | tail -n 1)"
+        [[ "$active_port" =~ ^[0-9]+$ ]] &&
+            (( active_port >= PORT_MIN && active_port <= PORT_MAX )) ||
+            die "Invalid active port in deployment state"
 
-        docker build \
-            --build-arg APP_FILE=index.html \
-            -t "${IMAGE_NAME}:v1" .
+        container_exists "$active_slot" ||
+            die "State points to a missing active container"
 
-        docker run -d \
-            --name "$ACTIVE_NAME" \
-            --restart unless-stopped \
-            -p "${bootstrap_port}:80" \
-            "${IMAGE_NAME}:v1"
+        [[ "$(docker inspect -f '{{.State.Running}}' "$active_slot")" == "true" ]] ||
+            die "Active container is not running"
 
-        if ! wait_for_health "$bootstrap_port"; then
-            docker rm -f "$ACTIVE_NAME" || true
-            die "Version 1 bootstrap health check failed"
+        wait_for_health "$active_port" ||
+            die "Active application is unhealthy; refusing deployment"
+
+        if [[ "$active_slot" == "green" ]]; then
+            candidate_slot="blue"
+        else
+            candidate_slot="green"
+        fi
+    else
+        if container_exists green || container_exists blue; then
+            die "Green/blue containers exist but state is missing; inspect before proceeding"
         fi
 
-        write_nginx_config "$bootstrap_port"
-        reload_nginx
-
-        if ! curl --fail --silent \
-            "http://127.0.0.1:${NGINX_PORT}/" >/dev/null; then
-            docker rm -f "$ACTIVE_NAME" || true
-            die "Nginx could not reach the bootstrap application"
-        fi
-
-        save_state "$bootstrap_port"
-        log "Version 1 is now the stable Green deployment"
+        candidate_slot="green"
+        log "First deployment: preparing the Green slot"
     fi
 
-    # Read the actual published port from the active container.
-    active_port="$(
-        docker port "$ACTIVE_NAME" 80/tcp |
-        head -n 1 |
-        awk -F: '{print $NF}'
-    )"
-
-    [[ "$active_port" =~ ^[0-9]+$ ]] ||
-        die "Could not determine the active Green container port"
-
-    log "Current Green deployment is running on port $active_port"
-
-    # Preserve the current Nginx configuration for rollback.
-    if sudo -n test -f "$NGINX_CONF"; then
-        old_config_backup="$(mktemp)"
-        sudo -n cp "$NGINX_CONF" "$old_config_backup"
-        had_previous_config=1
+    if container_exists "$candidate_slot"; then
+        log "Removing previous inactive container: $candidate_slot"
+        docker rm -f "$candidate_slot"
     fi
 
-    # Choose a fresh port and deploy the incoming Version 2 container.
-    candidate_port="$(find_available_port | tail -n 1)"
+    candidate_port="$(find_available_port)" ||
+        die "No available port found between $PORT_MIN and $PORT_MAX"
+
+    image_tag="${GITHUB_SHA:-local}-$(date +%s)"
+
+    log "Building $APP_FILE as ${IMAGE_NAME}:${image_tag}"
 
     docker build \
-        --build-arg APP_FILE=index-v2.html \
-        -t "${IMAGE_NAME}:incoming" .
+        --build-arg "APP_FILE=$APP_FILE" \
+        -t "${IMAGE_NAME}:${image_tag}" .
+
+    log "Starting candidate $candidate_slot on port $candidate_port"
 
     docker run -d \
-        --name "$CANDIDATE_NAME" \
+        --name "$candidate_slot" \
         --restart unless-stopped \
-        -p "${candidate_port}:80" \
-        "${IMAGE_NAME}:incoming"
+        -p "127.0.0.1:${candidate_port}:80" \
+        "${IMAGE_NAME}:${image_tag}"
 
     if ! wait_for_health "$candidate_port"; then
-        cleanup_candidate
-        die "Candidate health check failed; active Green remains unchanged"
+        docker rm -f "$candidate_slot" || true
+        die "Candidate health check failed; traffic was not switched"
     fi
 
-    log "Candidate passed its direct health check"
-
-    # Switch traffic only after the candidate is healthy.
-    write_nginx_config "$candidate_port"
-
-    if ! reload_nginx; then
-        log "Nginx configuration test or reload failed"
-
-        if (( had_previous_config )); then
-            sudo -n cp "$old_config_backup" "$NGINX_CONF"
-            reload_nginx || log "WARNING: Nginx rollback reload failed"
-        fi
-
-        cleanup_candidate
-        die "Traffic switch failed; old Green container was preserved"
+    if ! curl --fail --silent --max-time 5 \
+        "http://127.0.0.1:${candidate_port}/" |
+        grep -Fq "Version: $([[ "$version_label" == "GREEN" ]] && echo 1 || echo 2)"; then
+        docker rm -f "$candidate_slot" || true
+        die "Candidate content does not match the requested version"
     fi
 
-    switched=1
+    log "Candidate is healthy. Asking the privileged helper to switch Nginx."
 
-    # Verify the new version through Nginx before promoting it.
-    if ! curl --fail --silent \
-        "http://127.0.0.1:${NGINX_PORT}/" >/dev/null; then
-        log "Nginx verification failed; rolling back"
-
-        if (( had_previous_config )); then
-            sudo -n cp "$old_config_backup" "$NGINX_CONF"
-            reload_nginx || log "WARNING: Nginx rollback reload failed"
-        fi
-
-        cleanup_candidate
-        die "Post-switch verification failed"
+    if ! sudo -n "$NGINX_HELPER" "$candidate_port" "$version_label"; then
+        log "Nginx switch failed; removing the candidate container"
+        docker rm -f "$candidate_slot" || true
+        die "Switch failed; the helper should restore its previous upstream"
     fi
 
-    # Preserve the old container until traffic has been verified.
-    docker rename "$ACTIVE_NAME" "$PREVIOUS_NAME"
-    docker rename "$CANDIDATE_NAME" "$ACTIVE_NAME"
-
-    save_state "$candidate_port"
-
-    # The new Green is active and verified. Remove the old container.
-    docker rm -f "$PREVIOUS_NAME"
-
-    [[ -z "$old_config_backup" ]] || rm -f "$old_config_backup"
+    if ! save_state "$candidate_slot" "$candidate_port"; then
+        die "Could not save deployment state; inspect Nginx and containers"
+    fi
 
     log "Deployment successful"
-    log "New stable Green port: $candidate_port"
-    log "Application URL: http://127.0.0.1:${NGINX_PORT}/"
+    log "Active slot: $candidate_slot"
+    log "Active port: $candidate_port"
+    log "Application file: $APP_FILE"
+    log "Version label: $version_label"
+    log "Application URL: http://127.0.0.1/"
+    log "Previous slot is retained until the next deployment"
 }
 
 deploy "$@"
-
